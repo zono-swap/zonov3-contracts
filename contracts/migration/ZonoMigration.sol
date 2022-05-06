@@ -322,9 +322,45 @@ library Address {
 
 interface IBEP20 {
     /**
+     * @dev Returns the amount of tokens in existence.
+     */
+    function totalSupply() external view returns (uint256);
+
+    /**
+     * @dev Returns the token decimals.
+     */
+    function decimals() external view returns (uint8);
+
+    /**
+     * @dev Returns the token symbol.
+     */
+    function symbol() external view returns (string memory);
+
+    /**
+     * @dev Returns the token name.
+     */
+    function name() external view returns (string memory);
+
+    /**
+     * @dev Returns the erc20 token owner.
+     */
+    function getOwner() external view returns (address);
+
+    /**
      * @dev Returns the amount of tokens owned by `account`.
      */
     function balanceOf(address account) external view returns (uint256);
+
+    /**
+     * @dev Moves `amount` tokens from the caller's account to `recipient`.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transfer(address recipient, uint256 amount)
+        external
+        returns (bool);
 
     /**
      * @dev Returns the remaining number of tokens that `spender` will be
@@ -339,15 +375,20 @@ interface IBEP20 {
         returns (uint256);
 
     /**
-     * @dev Moves `amount` tokens from the caller's account to `recipient`.
+     * @dev Sets `amount` as the allowance of `spender` over the caller's tokens.
      *
      * Returns a boolean value indicating whether the operation succeeded.
      *
-     * Emits a {Transfer} event.
+     * IMPORTANT: Beware that changing an allowance with this method brings the risk
+     * that someone may use both the old and the new allowance by unfortunate
+     * transaction ordering. One possible solution to mitigate this race
+     * condition is to first reduce the spender's allowance to 0 and set the
+     * desired value afterwards:
+     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+     *
+     * Emits an {Approval} event.
      */
-    function transfer(address recipient, uint256 amount)
-        external
-        returns (bool);
+    function approve(address spender, uint256 amount) external returns (bool);
 
     /**
      * @dev Moves `amount` tokens from `sender` to `recipient` using the
@@ -359,10 +400,28 @@ interface IBEP20 {
      * Emits a {Transfer} event.
      */
     function transferFrom(
-        address from,
-        address to,
+        address sender,
+        address recipient,
+        uint256 amount
+    ) external returns (bool);
+
+    /**
+     * @dev Emitted when `value` tokens are moved from one account (`from`) to
+     * another (`to`).
+     *
+     * Note that `value` may be zero.
+     */
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    /**
+     * @dev Emitted when the allowance of a `spender` for an `owner` is set by
+     * a call to {approve}. `value` is the new allowance.
+     */
+    event Approval(
+        address indexed owner,
+        address indexed spender,
         uint256 value
-    ) external returns (bool ok);
+    );
 }
 
 /**
@@ -501,11 +560,11 @@ library SafeBEP20 {
  * This contract is only required for intermediate, library-like contracts.
  */
 abstract contract Context {
-    function _msgSender() internal view virtual returns (address payable) {
+    function _msgSender() internal view virtual returns (address) {
         return msg.sender;
     }
 
-    function _msgData() internal view virtual returns (bytes memory) {
+    function _msgData() internal view virtual returns (bytes calldata) {
         this; // silence state mutability warning without generating bytecode - see https://github.com/ethereum/solidity/issues/2691
         return msg.data;
     }
@@ -533,46 +592,26 @@ abstract contract Ownable is Context {
         address indexed newOwner
     );
 
-    /**
-     * @dev Initializes the contract setting the deployer as the initial owner.
-     */
-    constructor() internal {
+    constructor() {
         address msgSender = _msgSender();
         _owner = msgSender;
         emit OwnershipTransferred(address(0), msgSender);
     }
 
-    /**
-     * @dev Returns the address of the current owner.
-     */
-    function owner() public view returns (address) {
+    function owner() public view virtual returns (address) {
         return _owner;
     }
 
-    /**
-     * @dev Throws if called by any account other than the owner.
-     */
     modifier onlyOwner() {
-        require(_owner == _msgSender(), "Ownable: caller is not the owner");
+        require(owner() == _msgSender(), "Ownable: caller is not the owner");
         _;
     }
 
-    /**
-     * @dev Leaves the contract without owner. It will not be possible to call
-     * `onlyOwner` functions anymore. Can only be called by the current owner.
-     *
-     * NOTE: Renouncing ownership will leave the contract without an owner,
-     * thereby removing any functionality that is only available to the owner.
-     */
     function renounceOwnership() public virtual onlyOwner {
         emit OwnershipTransferred(_owner, address(0));
         _owner = address(0);
     }
 
-    /**
-     * @dev Transfers ownership of the contract to a new account (`newOwner`).
-     * Can only be called by the current owner.
-     */
     function transferOwnership(address newOwner) public virtual onlyOwner {
         require(
             newOwner != address(0),
@@ -592,11 +631,12 @@ contract ZonoMigration is Ownable {
 
     bool public paused = false; // Pause migration
     uint16 public migrationRate = 100; // Migrate 1 zonov2 to 1 zonov3
-
+    uint256 public startAt = 1651968000; // May 8, 2022 00:00:00
     uint256 public maxLimit = 10000000 ether; // Max migration limit per user
     uint256 public totalMigrated;
 
     mapping(address => bool) public whitelist;
+    mapping(address => bool) public blacklist;
     mapping(address => uint256) public userInfo;
 
     event TokensMigrated(
@@ -606,8 +646,8 @@ contract ZonoMigration is Ownable {
     );
 
     constructor(IBEP20 _fromToken, IBEP20 _toToken) {
-        require(_fromToken != address(0), "Invalid from token");
-        require(_toToken != address(0), "Invalid to token");
+        require(address(_fromToken) != address(0), "Invalid from token");
+        require(address(_toToken) != address(0), "Invalid to token");
         fromToken = _fromToken;
         toToken = _toToken;
     }
@@ -615,6 +655,8 @@ contract ZonoMigration is Ownable {
     // Migrate tokens
     function migrate(uint256 _fromAmount) external {
         require(!paused, "Paused!!!");
+        require(!blacklist[_msgSender()], "Blacklisted account");
+        require(block.timestamp >= startAt, "Not started yet");
         require(_fromAmount > 0, "Invalid amount");
 
         uint256 balanceBefore = fromToken.balanceOf(address(this));
@@ -629,6 +671,7 @@ contract ZonoMigration is Ownable {
             "Exceeds limitation"
         );
         userInfo[_msgSender()] = userMigratedAmount.add(_fromAmount);
+        totalMigrated = totalMigrated.add(_fromAmount);
 
         uint256 toAmount = _fromAmount.mul(migrationRate).div(100);
         require(
@@ -636,10 +679,7 @@ contract ZonoMigration is Ownable {
             "Insufficient balance"
         );
 
-        totalMigrated = totalMigrated.add(_fromAmount);
-
         toToken.safeTransfer(_msgSender(), toAmount);
-
         emit TokensMigrated(_msgSender(), _fromAmount, toAmount);
     }
 
@@ -651,8 +691,8 @@ contract ZonoMigration is Ownable {
         external
         onlyOwner
     {
-        require(_fromToken != address(0), "Invalid from token");
-        require(_toToken != address(0), "Invalid to token");
+        require(address(_fromToken) != address(0), "Invalid from token");
+        require(address(_toToken) != address(0), "Invalid to token");
         fromToken = _fromToken;
         toToken = _toToken;
     }
@@ -670,8 +710,17 @@ contract ZonoMigration is Ownable {
      * @notice Set max limit
      * @dev Only owner can call this function
      */
-    function setMaxLimit(uint16 _limit) external onlyOwner {
+    function setMaxLimit(uint256 _limit) external onlyOwner {
         maxLimit = _limit;
+    }
+
+    /**
+     * @notice Set migration start time
+     * @dev Only owner can call this function
+     */
+    function setMigrationStartAt(uint256 _startAt) external onlyOwner {
+        require(_startAt >= block.timestamp, "Should be later time");
+        startAt = _startAt;
     }
 
     /**
@@ -682,6 +731,7 @@ contract ZonoMigration is Ownable {
         external
         onlyOwner
     {
+        require(!blacklist[_account], "Blacklisted account");
         whitelist[_account] = _whitelisted;
     }
 
@@ -695,7 +745,35 @@ contract ZonoMigration is Ownable {
     ) external onlyOwner {
         uint256 count = _accounts.length;
         for (uint256 i = 0; i < count; i++) {
+            require(!blacklist[_accounts[i]], "Blacklisted account");
             whitelist[_accounts[i]] = _whitelisted;
+        }
+    }
+
+    /**
+     * @notice Include / Exclude account in blacklist
+     * @dev Only owner can call this fundtion
+     */
+    function includeBlacklist(address _account, bool _blacklisted)
+        external
+        onlyOwner
+    {
+        require(!whitelist[_account], "Whitelisted account");
+        blacklist[_account] = _blacklisted;
+    }
+
+    /**
+     * @notice Include / Exclude several accounts in blacklist
+     * @dev Only owner can call this fundtion
+     */
+    function includeBulkBlacklist(
+        address[] calldata _accounts,
+        bool _blacklisted
+    ) external onlyOwner {
+        uint256 count = _accounts.length;
+        for (uint256 i = 0; i < count; i++) {
+            require(!whitelist[_accounts[i]], "Whitelisted account");
+            blacklist[_accounts[i]] = _blacklisted;
         }
     }
 
