@@ -1,6 +1,6 @@
 /**
  *Submitted for verification at BscScan.com on 2022-03-25
-*/
+ */
 
 // SPDX-License-Identifier: MIT
 
@@ -916,7 +916,7 @@ contract ZonoV3Pool is Ownable, ReentrancyGuard {
     address public ZONO_POOL_FACTORY;
 
     // Whether a limit is set for users
-    bool public hasUserLimit;
+    bool public hasUserLimit = false;
 
     // Whether it is initialized
     bool public isInitialized;
@@ -933,16 +933,17 @@ contract ZonoV3Pool is Ownable, ReentrancyGuard {
     // The block number of the last pool update
     uint256 public lastRewardBlock;
 
-    uint16 public constant MAX_DEPOSIT_FEE = 2000;
-    
-    // The deposit fee
-    uint16 public depositFee;
+    uint16 public constant MAX_FEE = 2000;
 
-    // The fee address
-    address public feeAddress;
+    // The fee configurations
+    uint16 public depositFee = 200; // deposit fee, default 2%
+    uint16 public unlockFee = 500; // withdraw fee before lock ends, default 5%
+    uint256 public lockPeriod = 604800; // lock period, default 7 days
+    bool public isFlexibleLock = true; // Allow unlock before lock ends with charging fee, default true
+    address public feeAddress; // fee address
 
-    // The pool limit (0 if none)
-    uint256 public poolLimitPerUser;
+    // The pool limit (0 if no limit)
+    uint256 public poolLimitPerUser = 0;
 
     // Reward tokens created per block.
     uint256 public rewardPerBlock;
@@ -966,6 +967,7 @@ contract ZonoV3Pool is Ownable, ReentrancyGuard {
         uint256 amount; // How many staked tokens the user has provided
         uint256 pending; // reward tokens not sent yet
         uint256 rewardDebt; // Reward debt
+        uint256 lastDepositAt; // Last deposited time
     }
 
     event AdminTokenRecovery(address tokenRecovered, uint256 amount);
@@ -974,7 +976,8 @@ contract ZonoV3Pool is Ownable, ReentrancyGuard {
     event EmergencyRewardWithdraw(uint256 amount);
     event NewStartAndEndBlocks(uint256 startBlock, uint256 endBlock);
     event NewRewardPerBlock(uint256 rewardPerBlock);
-    event NewDepositFee(uint16 depositFee);
+    event NewFeePercentage(uint16 depositFee, uint16 unlockFee);
+    event NewLockProps(uint256 lockPeriod, bool isFlexibleLock);
     event NewFeeAddress(address feeAddress);
     event NewPoolLimit(uint256 poolLimitPerUser);
     event RewardsStop(uint256 blockNumber);
@@ -991,9 +994,6 @@ contract ZonoV3Pool is Ownable, ReentrancyGuard {
      * @param _rewardPerBlock: reward per block (in rewardToken)
      * @param _startBlock: start block
      * @param _bonusEndBlock: end block
-     * @param _poolLimitPerUser: pool limit per user in stakedToken (if any, else 0)
-     * @param _depositFee: deposit fee
-     * @param _feeAddress: fee address
      * @param _admin: admin address with ownership
      */
     function initialize(
@@ -1002,14 +1002,11 @@ contract ZonoV3Pool is Ownable, ReentrancyGuard {
         uint256 _rewardPerBlock,
         uint256 _startBlock,
         uint256 _bonusEndBlock,
-        uint256 _poolLimitPerUser,
-        uint16 _depositFee,
-        address _feeAddress,
         address _admin
     ) external {
         require(!isInitialized, "Already initialized");
         require(msg.sender == ZONO_POOL_FACTORY, "Not factory");
-        require(_feeAddress != address(0), "Invalid zero address");
+        require(_admin != address(0), "Invalid admin");
 
         _stakedToken.balanceOf(address(this));
         _rewardToken.balanceOf(address(this));
@@ -1028,14 +1025,6 @@ contract ZonoV3Pool is Ownable, ReentrancyGuard {
         rewardPerBlock = _rewardPerBlock;
         startBlock = _startBlock;
         bonusEndBlock = _bonusEndBlock;
-        require(_depositFee <= MAX_DEPOSIT_FEE, "Invalid deposit fee");
-        depositFee = _depositFee;
-        feeAddress = _feeAddress;
-
-        if (_poolLimitPerUser > 0) {
-            hasUserLimit = true;
-            poolLimitPerUser = _poolLimitPerUser;
-        }
 
         uint256 decimalsRewardToken = uint256(rewardToken.decimals());
         require(decimalsRewardToken < 30, "Must be inferior to 30");
@@ -1086,6 +1075,7 @@ contract ZonoV3Pool is Ownable, ReentrancyGuard {
             }
 
             user.amount = user.amount.add(_amount);
+            user.lastDepositAt = block.timestamp;
             stakedSupply = stakedSupply.add(_amount);
         }
 
@@ -1118,7 +1108,18 @@ contract ZonoV3Pool is Ownable, ReentrancyGuard {
         if (_amount > 0) {
             user.amount = user.amount.sub(_amount);
             stakedSupply = stakedSupply.sub(_amount);
-            stakedToken.safeTransfer(msg.sender, _amount);
+            // Withdraw before lock time needs withdraw fee
+            if (block.timestamp < user.lastDepositAt.add(lockPeriod)) {
+                require(isFlexibleLock, "Unable to withdraw when locked");
+                uint256 withdrawFee = _amount.mul(unlockFee).div(10000);
+                if (withdrawFee > 0) {
+                    stakedToken.safeTransfer(feeAddress, withdrawFee);
+                    _amount = _amount.sub(withdrawFee);
+                }
+            }
+            if (_amount > 0) {
+                stakedToken.safeTransfer(msg.sender, _amount);
+            }
         }
 
         user.rewardDebt = user.amount.mul(accTokenPerShare).div(
@@ -1250,7 +1251,7 @@ contract ZonoV3Pool is Ownable, ReentrancyGuard {
         emit NewPoolLimit(poolLimitPerUser);
     }
 
-    /*
+    /**
      * @notice Update reward per block
      * @dev Only callable by owner.
      * @param _rewardPerBlock: the reward per block
@@ -1261,18 +1262,41 @@ contract ZonoV3Pool is Ownable, ReentrancyGuard {
         emit NewRewardPerBlock(_rewardPerBlock);
     }
 
-    /*
-     * @notice Update deposit fee
+    /**
+     * @notice Update deposit / unlock fee percentage
      * @dev Only callable by owner.
      * @param _depositFee: the deposit fee
      */
-    function updateDepositFee(uint16 _depositFee) external onlyOwner {
-        require(_depositFee <= MAX_DEPOSIT_FEE, "Invalid deposit fee");
+    function updateFeePercentage(uint16 _depositFee, uint16 _unlockFee)
+        external
+        onlyOwner
+    {
+        require(
+            _depositFee <= MAX_FEE && _unlockFee <= MAX_FEE,
+            "Too much fee"
+        );
         depositFee = _depositFee;
-        emit NewDepositFee(depositFee);
+        unlockFee = _unlockFee;
+        emit NewFeePercentage(_depositFee, _unlockFee);
     }
 
-    /*
+    /**
+     * @notice Update lock period and flexible lock flag
+     * @dev Only callable by owner
+     * @param _lockPeriod: lock period
+     * @param _isFlexibleLock: flag showing flexible lock or not
+     */
+    function updateLockProps(uint256 _lockPeriod, bool _isFlexibleLock)
+        external
+        onlyOwner
+    {
+        lockPeriod = _lockPeriod;
+        isFlexibleLock = _isFlexibleLock;
+
+        emit NewLockProps(_lockPeriod, _isFlexibleLock);
+    }
+
+    /**
      * @notice Update fee address
      * @dev Only callable by owner.
      * @param _feeAddress: the fee address
@@ -1280,7 +1304,6 @@ contract ZonoV3Pool is Ownable, ReentrancyGuard {
     function updateFeeAddress(address _feeAddress) external onlyOwner {
         require(_feeAddress != address(0), "Invalid zero address");
         require(feeAddress != _feeAddress, "Same fee address already set");
-
         feeAddress = _feeAddress;
         emit NewFeeAddress(feeAddress);
     }
@@ -1379,15 +1402,46 @@ contract ZonoV3Pool is Ownable, ReentrancyGuard {
         }
     }
 }
+
 // File: contracts/ZonoPoolFactory.sol
 
 pragma solidity 0.6.12;
 
 contract ZonoPoolFactory is Ownable {
+    uint16 public constant MAX_FEE = 2000;
+
+    uint16 public defaultDepositFee = 200;
+    uint16 public defaultUnlockFee = 500;
+    bool public defaultIsFlexibleLock = true;
+    uint256 public defaultLockPeriod;
+    address public defaultFeeAddress;
+
     event NewZonoV3PoolContract(address indexed smartChef);
 
     constructor() public {
         //
+    }
+
+    /**
+     * @notice Update default configuration
+     * @dev Only owner can call the function
+     */
+    function updateDefaultConfiguration(
+        uint16 _depositFee,
+        uint16 _unlockFee,
+        bool _isFlexibleLock,
+        uint256 _lockPeriod,
+        address _feeAddress
+    ) external onlyOwner {
+        require(
+            _depositFee <= MAX_FEE && _unlockFee <= MAX_FEE,
+            "Too much fee"
+        );
+        defaultDepositFee = _depositFee;
+        defaultUnlockFee = _unlockFee;
+        defaultIsFlexibleLock = _isFlexibleLock;
+        defaultLockPeriod = _lockPeriod;
+        defaultFeeAddress = _feeAddress;
     }
 
     /**
@@ -1397,8 +1451,6 @@ contract ZonoPoolFactory is Ownable {
      * @param _rewardPerBlock: reward per block (in rewardToken)
      * @param _startBlock: start block
      * @param _bonusEndBlock: end block
-     * @param _depositFee: deposit fee
-     * @param _poolLimitPerUser: pool limit per user in stakedToken (if any, else 0)
      * @param _admin: admin address with ownership
      */
     function deployPool(
@@ -1407,9 +1459,6 @@ contract ZonoPoolFactory is Ownable {
         uint256 _rewardPerBlock,
         uint256 _startBlock,
         uint256 _bonusEndBlock,
-        uint256 _poolLimitPerUser,
-        uint16 _depositFee,
-        address _feeAddress,
         address _admin
     ) external onlyOwner {
         require(_stakedToken.totalSupply() >= 0);
@@ -1436,11 +1485,18 @@ contract ZonoPoolFactory is Ownable {
             _rewardPerBlock,
             _startBlock,
             _bonusEndBlock,
-            _poolLimitPerUser,
-            _depositFee,
-            _feeAddress,
-            _admin
+            address(this)
         );
+        ZonoV3Pool(smartChefAddress).updateFeePercentage(
+            defaultDepositFee,
+            defaultUnlockFee
+        );
+        ZonoV3Pool(smartChefAddress).updateLockProps(
+            defaultLockPeriod,
+            defaultIsFlexibleLock
+        );
+        ZonoV3Pool(smartChefAddress).updateFeeAddress(defaultFeeAddress);
+        ZonoV3Pool(smartChefAddress).transferOwnership(_admin);
 
         emit NewZonoV3PoolContract(smartChefAddress);
     }
