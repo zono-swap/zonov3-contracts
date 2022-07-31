@@ -1179,7 +1179,7 @@ contract ZonoNftFarm is Ownable, ReentrancyGuard, IERC721Receiver {
     uint256 public endAt; // NFT Farming End Date
 
     uint256 public totalNftsToSell = 100; // Total NFTs to sell
-    uint256 public nftPrice = 250000 ether; // NFT price in staking token
+    uint256 public nftPrice = 650000 ether; // NFT price in staking token
     uint256 public maxPerUser = 3; // Max NFTs an user can get
     uint256 public totalNftsSold = 0; // Nfts sold to users including locked
     uint256 public totalNftsLocked = 0; // Nfts locked now
