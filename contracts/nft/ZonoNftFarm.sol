@@ -1416,7 +1416,7 @@ contract ZonoNftFarm is Ownable, ReentrancyGuard, IERC721Receiver {
     //function to end the sale
     //only owner can call this function
     function endFarming() external onlyOwner {
-        require(endAt <= block.timestamp, "Farming already finished");
+        require(endAt > block.timestamp, "Farming already finished");
         endAt = block.timestamp;
         if (startAt > block.timestamp) {
             startAt = block.timestamp;
